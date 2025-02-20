@@ -1,117 +1,97 @@
-import json
-import requests
 import argparse
+import meraki_dashboard
+from copy import deepcopy
 
 def arguments ():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-s', '--ssid-number',
+    parser.add_argument('-s', '--ssid-number', required=True,
                         action='store', nargs='?', default=0,
                         type=int, help='Integer of the SSID number for which you want to remove Umbrella configuration.')
-    parser.add_argument('-o', '--org-id', required=True,
+    parser.add_argument('-u', '--username', default='',
+                        type=str, help='email for dashboard login (should be non-sso account).')
+    parser.add_argument('-p', '--password', default='',
+                        type=str, help='Password for provided login email address.')
+    parser.add_argument('-o', '--org-id', default='',
                         type=str, help='Organization number shown at the bottom of the meraki dashboard when looking at any element of a single org.')
-    parser.add_argument('-a', '--administered-orgs-url', required=True,
-                        type=str, help='Entire URL of the dashboard API call /manage/organization/administered_orgs, can be any you are authorized to look at')
-    parser.add_argument('--headers', required=True,
-                        type=str, help='json output of headers used for the administered_orgs call in string format')
-    parser.add_argument('--cookies', required=True,
-                        type=str, help='json output of cookies used for an authenticated call on the dashboard in string format')
-    parser.add_argument('-n', '--network-name', default='',
-                        type=str, help="(Optional) network name of singular network to target for umbrella removal")
+    parser.add_argument('-on', '--org-name', default='',
+                        type=str, help='Name of organization for which you want umbrella removed from the specified ssid in all networks.')
+    parser.add_argument('-n', '--network-name', default=[], nargs='+',
+                        help="Network Name(s) for which you want umbrella removed from the ssid.")
 
     return parser.parse_args()
 
-def purge_umbrella(org_json_data: dict, org_id: str,
-                    network: str, ssid_number: int,
-                    headers: dict, cookies: dict):
-    
-    network_id = org_json_data[org_id]['locales'][network]['id']
-    #### GET ALL NETWORKS WITH TYPE "WIRELESS"
-    if "wireless" in org_json_data[org_id]['locales'][network]:
-        net = org_json_data[org_id]['locales'][network_id]
-        network_name = net['name']
-        network_short_name = net['tag']
-        network_id = network,
-        ui_wireless_id = net['wireless']
-        shard_id = org_json_data[org_id]['shard_id']
-
-        print("DELETING UMBRELLA CONFIGURATION FOR NETWORK: ", network_name)
-
+def purge_umbrella(dashboard: type[meraki_dashboard.MerakiDashboardAPI], locale: type[meraki_dashboard.locales], ssid_number: int):
+   if "wireless" in locale._fields:
+        print("DELETING UMBRELLA CONFIGURATION FOR NETWORK: ", locale.name)
         #### FORMAT PAYLOAD
         data = {
             'entityType': 'ssid',
             'entityNumber': ssid_number
         }
-
+        headers = deepcopy(dashboard._json_headers)
+        headers['Accept'] = 'application/json, text/javascript, */*, q=0.01'
+        headers['Referer'] = dashboard._last_uri
+        headers['X-CSRF-TOKEN'] = dashboard.shard_headers[locale.shard_id]['csrf_token']
+        headers['X-Pageload-Request-Id'] = dashboard.shard_headers[locale.shard_id]['pageload_id']
+        headers['X-Requested-With'] = 'XMLHttpRequest'
         #### FORMAT URL
-        url = f'https://n{shard_id}.meraki.com/{network_short_name}/n/{ui_wireless_id}/manage/configure/disconnect_umbrella'
+        url = 'https://n{locale.shard_id}.meraki.com/{locale.tag}/n/{locale.wireless}/manage/configure/disconnect_umbrella'.format(locale=locale)
         print("URL: ", url)
-
         #### SEND REQUEST
-        response = requests.post(
+        response = dashboard.session.post(
             url,
-            cookies=cookies,
             headers=headers,
             data=data,
         )
-
         #### PRINT RESPONSE
         if response.status_code == 200:
-            print("SUCCESSFULLY DELETED UMBRELLA CONFIGURATION FOR NETWORK: ", network_name, "\n\n")
+            print("SUCCESSFULLY DELETED UMBRELLA CONFIGURATION FOR NETWORK: ", locale.name, "\n\n")
         else:
-            print("FAILED TO DELETE UMBRELLA CONFIGURATION FOR NETWORK: ", network_name)
+            print("FAILED TO DELETE UMBRELLA CONFIGURATION FOR NETWORK: ", locale.name)
             print("STATUS CODE: ", response.status_code)
             print("RESPONSE TEXT: ", response.text)
             print("RESPONSE JSON: ", response.json(), "\n\n")
 
-def main (user_headers: str, ssid_number: int, org_id: str,
-            administered_orgs_url: str, target_network_name: str,
-            user_cookies: str):
+def main (username: str, password: str, org_id: str, org_name: str, network_name: list, ssid_number: int):
 
-    cookies = json.loads(user_cookies)
-
-    headers = json.loads(user_headers)
-
-    #### GET ALL ORGS AND NETWORKS
-    print("GETTING ORGANIZATIONS...")
-
-    administered_orgs = requests.get(
-        administered_orgs_url,
-        cookies=cookies,
-        headers=headers,
-    )
-
-    #### SINCE ONLY THE ACTIVE ORG RETURNS NETWORK DATA, WE NEED TO LOOP THROUGH ALL ORGS TO FIND THE ONE WE WANT
-    for administered_org in administered_orgs.json():
-        if administered_org == org_id:
-            #### ONCE WE'VE FOUND THE ORG, WE CAN GET THE NETWORKS
-            org_name = administered_orgs.json()[administered_org]['name']
-            org_eid = administered_orgs.json()[administered_org]['eid']
-            org_shard_id = administered_orgs.json()[administered_org]['shard_id']
-
-            url = f'https://n{org_shard_id}.meraki.com/o/{org_eid}/manage/organization/administered_orgs'
-
-            org = requests.get(
-                url,
-                cookies=cookies,
-                headers=headers,
-            )
-            org_json_data = org.json()
-
-            #### PARSE NETWORKS
-            for network in org_json_data[org_id]['locales']:
-                if target_network_name:
-                    if target_network_name == org_json_data[org_id]['locales'][network]['name']:
-                        purge_umbrella(org_json_data, org_id, network, ssid_number, headers, cookies)
-                else:
-                    purge_umbrella(org_json_data, org_id, network, ssid_number, headers, cookies)
-
-
+    dashboard = meraki_dashboard.MerakiDashboardAPI(username=username, password=password)
+    
+    dashboard.meraki_login()
+    locale_list = []
+    if (org_id or org_name) != '':
+        # unfortunate reality of multi-org accounts is we don't know what orgs we can access (specifically their shard_ids)
+        # until we make at least one call to get administered_orgs, we'll call the default, check if we have our desired org
+        # if not we will make a second call and ideally we have it then, or a typo
+        dashboard.get_org_data(id=org_id, name=org_name)
+        dashboard.parse_values()
+        desired_org = dashboard.get_org(name=org_name, id=org_id)
+        if desired_org.id == '':
+            dashboard.get_org_data(id=org_id, name=org_name)
+            desired_org = dashboard.get_org(name=org_name, id=org_id)
+        if desired_org.id != '':
+            locale_list.extend([locale for locale in dashboard.locales if locale.org_id == desired_org.id])
+    else:
+        #### GET ALL ORGS AND NETWORKS
+        print("GETTING ORGANIZATIONS AND NETWORK DATA...")
+        dashboard.get_orgs_data()
+        dashboard.parse_values()
+    if len(network_name) > 0:
+        locale_list.extend([locale for locale in dashboard.locales if locale.name in network_name])
+    if len(locale_list) > 0:
+        # user a set() to remove duplicate locales
+        for i,locale in enumerate(set(locale_list)):
+            purge_umbrella(dashboard, locale, ssid_number)
+            if i % 100 == 0:
+                dashboard.refresh_token(locale.shard_id)
+    else:
+        print("No networks selected/found in dashboard data.")
 
 if __name__ == "__main__":
     main_args = arguments()
-    main(user_headers=main_args.headers,
-            user_cookies=main_args.cookies,
-            ssid_number=main_args.ssid_number,
-            org_id=main_args.org_id,
-            administered_orgs_url=main_args.administered_orgs_url,
-            target_network_name=main_args.network_name)
+    main(username=main_args.username,
+         password=main_args.password,
+         org_id=main_args.org_id,
+         org_name=main_args.org_name,
+         network_name=main_args.network_name,
+         ssid_number=main_args.ssid_number,
+         )
